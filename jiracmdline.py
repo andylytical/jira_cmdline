@@ -5,13 +5,9 @@ import sys
 import argparse
 import fileinput
 import pprint
+import os
+import ConfigParser
 import jira
-
-program_defaults = { 'server': 'https://jira.ncsa.illinois.edu',
-                     'user': 'aloftus',
-                     'password': '',
-                     'project': 'BWSTOR',
-                   }
 
 
 # module level varibale to hold jira connection
@@ -20,15 +16,14 @@ conn = None
 args = None
 
 
-def parse_options():
+def parse_cmdline():
     desc = "List or modify jira tickets."
     epilog = """List or modify jira tickets.  Ticket ID's can be passed on cmdline or
         stdin.  The \"Modification\" options require a list of tickets to be
         given.  The \"List\" options can operate on a given set of tickets 
         (via cmdline or stdin), or when ticket id's are not given, will search
         the jira server for tickets assigned to the user (--list) 
-        or the project (--list_all).  Default action if no options specified is 
-        list."""
+        or the project (--list_all).  Default action is list."""
     parser = argparse.ArgumentParser( description=desc, epilog=epilog )
     parser.add_argument( 'ticketlist',
                          metavar='TICKET_ID',
@@ -39,16 +34,24 @@ def parse_options():
                         help="Search for valid users matching NAME" )
     parser.add_argument("-d", "--debug",
                         action='store_true',
-                        help="Print Debugging Information. Default: %(default)s")
+                        help="Print Debugging Information" )
     conngroup = parser.add_argument_group( 'Connection Options' )
-    conngroup.add_argument("-s", "--server",
-                        help="Jira Server To Connect To. Default: %(default)s")
-    conngroup.add_argument("-u", "--user",
-                        help="Jira User Name. Default: %(default)s")
-    conngroup.add_argument("-P", "--password",
-                        help="Password For The Jira Account")
-    conngroup.add_argument("-p", "--project",
-                        help="Project To Scan For. Default: %(default)s")
+    conngroup.add_argument("-s", "--jiraserver",
+                        help="Jira server to connect to. (cmdline or cfgfile)" )
+    conngroup.add_argument("-u", "--jirauser",
+                        help="Jira user name. (cmdline or cfgfile)" )
+    conngroup.add_argument("-p", "--jirapass",
+                        help="""Password for the jira account. (cmdline or cfgfile
+                        or interactive-prompt).""" )
+    conngroup.add_argument("-P", "--jiraproject",
+                        help="Project to scan for. (cmdline or cfgfile)" )
+    conngroup.add_argument('-f', "--cfgfile",
+                        help="""Config file containing jira Connection information.
+                        Ini-style format. Section "Connection" with one or more keys
+                        matching the names of these Connection options 
+                        (ie: jiraserver, jirauser, etc.)
+                        Default: %(default)s
+                        """)
     listgroup = parser.add_argument_group( 'List Options' )
     listgroup.add_argument("-l", "--list",
                         dest="list",
@@ -79,18 +82,34 @@ def parse_options():
     modgroup.add_argument("-g","--givetouser",
                         action='store',
                         help="User to give the ticket to (used with '-G' option)")
-    parser.set_defaults( **program_defaults )
+    parser.set_defaults(
+        cfgfile = os.path.join( os.environ[ 'HOME' ], '.jiracmdline.cfg' )
+        )
     args = parser.parse_args()
-    # Check for password
-    if not args.password or len( args.password ) < 1:
-        args.password = getpass.getpass()
+    # read defaults from config file
+    cfgoptions = {}
+    if os.path.isfile( args.cfgfile ):
+        cfg = ConfigParser.SafeConfigParser()
+        cfg.read( args.cfgfile )
+        cfgoptions = dict( cfg.items( "Connection" ) )
+    # use defaults for missing options (cmdline always overrides defaults)
+    for k in [ 'jiraserver', 'jirauser', 'jiraproject' ]:
+        if not getattr( args, k ):
+            try:
+                setattr( args, k, cfgoptions[ k ] )
+            except ( KeyError ) as e:
+                raise SystemExit( "Missing required option '{0}'".format( k ) )
+    # get password
+    if not args.jirapass:
+        if 'jirapass' in cfgoptions:
+            args.jirapass = cfgoptions[ 'jirapass' ]
+        elif sys.stdin.isatty():
+            args.jirapass = getpass.getpass()
+        else:
+            raise SystemExit( "Missing jira password" )
     # Check for mutually required params
     if args.give and not args.givetouser:
         raise SystemExit( "Givetouser is required with 'Give' option" )
-    # These options require a comment
-    if args.resolve:
-        if not args.comment:
-            raise SystemExit( "Comment is required" )
     # Check for ticketlist on stdin
     # isatty() returns false if there's something in stdin
     if not sys.stdin.isatty():
@@ -104,8 +123,8 @@ def parse_options():
 
 
 def jira_connect():
-    opts = { 'server': args.server }
-    return jira.client.JIRA( opts, basic_auth=( args.user,args.password ) )
+    opts = { 'server': args.jiraserver }
+    return jira.client.JIRA( opts, basic_auth=( args.jirauser,args.jirapass ) )
 
 
 def search_users( name ):
@@ -124,11 +143,11 @@ def do_search():
     searchstr = ( 'assignee=currentUser() and '
                   'project={project} and '
                   'status in ("open","in progress")' 
-                  ).format( project=args.project )
+                  ).format( project=args.jiraproject )
     if args.list_all:
         searchstr = ( 'project={project} and '
                       'status in ("open")'
-                      ).format( project=args.project )
+                      ).format( project=args.jiraproject )
     return conn.search_issues( searchstr )
 #          pprint.pprint( str( issue ) )
 #          pprint.pprint( issue.raw )
@@ -177,7 +196,7 @@ def do_modify():
         if args.comment:
             add_comment( issue )
         if args.take:
-            assign_issue( issue, args.user )
+            assign_issue( issue, args.jirauser )
         if args.give:
             if not is_valid_user( args.givetouser ):
                 raise SystemExit( "Invalid user: '{0}'".format( args.givetouser ) )
@@ -188,22 +207,19 @@ def do_modify():
 
 
 if __name__ == '__main__':
-    args = parse_options()
+    args = parse_cmdline()
     conn = jira_connect()
 
-    if args.list or args.list_all or args.cat:
+    if args.comment or args.resolve or args.take or args.give:
+        do_modify()
+    elif args.usersearch:
+        matches = search_users( args.usersearch )
+        pprint.pprint( matches )
+    else:
         issues = []
         if len( args.ticketlist ) > 0:
             issues = [ conn.issue( tname ) for tname in args.ticketlist ]
         else:
             issues = [ conn.issue( i.key ) for i in do_search() ]
         for issue in issues:
-            print_issue( issue )
-    elif args.comment or args.resolve or args.take or args.give:
-        do_modify()
-    elif args.usersearch:
-        matches = search_users( args.usersearch )
-        pprint.pprint( matches )
-    else:
-        for issue in [ conn.issue( i.key ) for i in do_search() ]:
             print_issue( issue )
